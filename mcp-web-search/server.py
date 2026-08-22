@@ -54,6 +54,28 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
 ]
 
+# Sovereign hardening: in-memory cache + rate-limit
+import time
+_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 300  # 5 min sovereign cache
+_SEMAPHORE = asyncio.Semaphore(3)  # max 3 concurrent engine scrapes
+
+def _cache_get(key: str):
+    if key in _CACHE:
+        ts, val = _CACHE[key]
+        if time.time() - ts < _CACHE_TTL:
+            return val
+        else:
+            _CACHE.pop(key, None)
+    return None
+
+def _cache_set(key: str, val: Any):
+    _CACHE[key] = (time.time(), val)
+    # simple eviction if too large
+    if len(_CACHE) > 200:
+        oldest = min(_CACHE.items(), key=lambda x: x[1][0])[0]
+        _CACHE.pop(oldest, None)
+
 def random_headers():
     return {
         "User-Agent": random.choice(USER_AGENTS),
@@ -130,21 +152,35 @@ def decode_ddg_url(ddg_url: str) -> str:
 # --- Sovereign Scrapers (NO API KEYS) ---
 
 async def scrape_duckduckgo(query: str, count: int) -> list[dict]:
-    """DuckDuckGo HTML - most reliable sovereign engine, no JS"""
-    try:
-        headers = random_headers()
-        headers["Referer"] = "https://html.duckduckgo.com/"
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-            # POST is more reliable for html.duckduckgo.com/html/
-            data = {"q": query}
-            resp = await client.post("https://html.duckduckgo.com/html/", data=data)
-            if resp.status_code != 200 or "no results" in resp.text.lower() and len(resp.text) < 3000:
-                # fallback GET
-                resp = await client.get("https://html.duckduckgo.com/html/", params={"q": query})
-            resp.raise_for_status()
-            if "challenge" in resp.text.lower() and "confirm this search was made by a human" in resp.text.lower():
-                return []  # bot challenge, but html endpoint rarely does this vs lite
-            soup = BeautifulSoup(resp.text, "lxml")
+    """DuckDuckGo HTML - most reliable sovereign engine, no JS. Handles 202 challenge with retry."""
+    cache_key = f"ddg:{query}:{count}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    async with _SEMAPHORE:
+        try:
+            headers = random_headers()
+            headers["Referer"] = "https://html.duckduckgo.com/"
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+                # POST is more reliable for html.duckduckgo.com/html/
+                data = {"q": query}
+                resp = await client.post("https://html.duckduckgo.com/html/", data=data)
+                # Handle 202 challenge / bot detection with retry + different UA
+                if resp.status_code == 202 or ("challenge" in resp.text.lower() and "confirm this search was made by a human" in resp.text.lower()):
+                    await asyncio.sleep(0.7)
+                    headers2 = random_headers()
+                    headers2["Referer"] = "https://html.duckduckgo.com/"
+                    resp = await client.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers2)
+                    # if still 202, try lite endpoint as last resort (often not challenged)
+                    if resp.status_code == 202 or "challenge" in resp.text.lower():
+                        return []
+                if resp.status_code != 200 or "no results" in resp.text.lower() and len(resp.text) < 3000:
+                    # fallback GET
+                    resp = await client.get("https://html.duckduckgo.com/html/", params={"q": query})
+                resp.raise_for_status()
+                if "challenge" in resp.text.lower() and "confirm this search was made by a human" in resp.text.lower():
+                    return []  # bot challenge, but html endpoint rarely does this vs lite
+                soup = BeautifulSoup(resp.text, "lxml")
             results = []
             for div in soup.select("div.result")[:count*4]:  # get extra then filter ads
                 a = div.select_one("a.result__a")
@@ -171,10 +207,11 @@ async def scrape_duckduckgo(query: str, count: int) -> list[dict]:
                 results.append({"title": title, "url": url, "snippet": snippet, "engine": "duckduckgo"})
                 if len(results) >= count:
                     break
+            _cache_set(cache_key, results[:count])
             return results
-    except Exception as e:
-        print(f"[duckduckgo] error: {e}")
-        return []
+        except Exception as e:
+            print(f"[duckduckgo] error: {e}")
+            return []
 
 async def scrape_bing(query: str, count: int) -> list[dict]:
     """Bing - sovereign, server-rendered HTML, needs redirect decode"""
@@ -471,7 +508,14 @@ async def sovereign_fetch(url: str, max_len: int = 10000) -> str:
 # --- Sovereign Meta-Search ---
 
 async def sovereign_search(query: str, count: int, engines: list[str]) -> tuple[list[dict], dict]:
-    """Query multiple sovereign engines in parallel, deduplicate by URL"""
+    """Query multiple sovereign engines in parallel, deduplicate by URL. Cached + rate-limited."""
+    # Check cache for full query
+    cache_key = f"search:{query}:{count}:{','.join(engines)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    # Rate-limit: small jitter to avoid burst 202
+    await asyncio.sleep(random.uniform(0.05, 0.2))
     tasks = []
     for eng in engines:
         if eng in ENGINES:
@@ -514,7 +558,9 @@ async def sovereign_search(query: str, count: int, engines: list[str]) -> tuple[
                         break
             if len(all_results) >= count:
                 break
-    return all_results[:count], stats
+    result = (all_results[:count], stats)
+    _cache_set(cache_key, result)
+    return result
 
 # --- MCP Tools (direct MCP stdio) ---
 

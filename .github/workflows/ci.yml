@@ -1,0 +1,73 @@
+name: Sovereign MCP CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install sovereign deps
+        run: |
+          pip install -e ./mcp-web-search
+          pip install pytest pytest-asyncio httpx beautifulsoup4 lxml
+      - name: Unit tests (sovereign, no API keys)
+        run: |
+          pytest mcp-web-search/tests/test_sovereign.py -v
+      - name: Verify no API keys in code
+        run: |
+          ! grep -r "TAVILY\|SERPER\|BRAVE_API_KEY" mcp-web-search/server.py
+          echo "Sovereign OK - no external keys"
+      - name: MCP stdio smoke test
+        run: |
+          timeout 30 python -c "
+          import asyncio
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+          async def main():
+              p = StdioServerParameters(command='python', args=['mcp-web-search/server.py'])
+              async with stdio_client(p) as (r,w):
+                  async with ClientSession(r,w) as s:
+                      await s.initialize()
+                      t = await s.list_tools()
+                      assert 'search_web' in [x.name for x in t.tools]
+                      r = await s.call_tool('search_web', arguments={'query': 'model context protocol', 'count': 2, 'engines': 'duckduckgo'})
+                      assert 'Sovereign Search Results' in r.content[0].text or 'No Results' in r.content[0].text
+                      assert '| # | Title | Engine | URL |' in r.content[0].text or 'No Results' in r.content[0].text
+                      print('MCP stdio markdown OK')
+          asyncio.run(main())
+          "
+      - name: Docker build
+        run: |
+          docker build -t sovereign-mcp-search:test ./mcp-web-search
+          echo "Docker build OK"
+
+  markdown-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check markdown outputs
+        run: |
+          pip install -e ./mcp-web-search
+          python -c "
+          import asyncio, sys
+          sys.path.insert(0, 'mcp-web-search')
+          import server
+          async def main():
+              txt = await server.search_web('test', 1, 'duckduckgo')
+              assert txt.startswith('#'), 'markdown must start with #'
+              assert 'Sovereign' in txt
+              print('Markdown OK')
+          asyncio.run(main())
+          "
