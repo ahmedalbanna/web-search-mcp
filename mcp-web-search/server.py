@@ -553,22 +553,50 @@ async def search_web(
 
     if not results:
         stats_str = ", ".join([f"{k}: {v}" for k,v in stats.items()])
-        return f"No results for '{query}'. Engines tried: {stats_str}. Tip: try different query or engines='all'."
+        return f"""# No Results
 
-    out = f"**Sovereign Search: \"{query}\"** | Engines: {', '.join(engine_list)} | Found {len(results)} results (sovereign, no API key)\n"
-    out += f"Engine stats: {', '.join([f'{k} {v}' for k,v in stats.items()])}\n\n"
+**Query:** `{query}`
+**Engines:** `{', '.join(engine_list)}`
+**Stats:** {stats_str}
+
+> Tip: try different query or `engines=\"all\"` for broader coverage.
+"""
+
+    # Clear markdown: header + metadata + table + detailed sections
+    def esc_md(s: str) -> str:
+        return s.replace("|", "\\|").replace("\n", " ").strip()
+
+    out = f"# Sovereign Search Results\n\n"
+    out += f"**Query:** `{esc_md(query)}` | **Engines:** `{', '.join(engine_list)}` | **Found:** `{len(results)}` | **Sovereign:** `no API key, direct scrape`\n\n"
+    out += f"**Engine Stats:** {', '.join([f'`{k}`: {v}' for k,v in stats.items()])}\n\n"
+    out += f"## Summary Table\n\n"
+    out += f"| # | Title | Engine | URL |\n"
+    out += f"|---|-------|--------|-----|\n"
     for i, r in enumerate(results, 1):
-        title = r.get("title","Untitled") or "Untitled"
+        title = esc_md(clean_text(r.get("title","Untitled") or "Untitled", 80))
         url = r.get("url","")
-        snippet = clean_text(r.get("snippet",""), 350)
         eng = r.get("engine","unknown")
-        out += f"### {i}. {title} `[{eng}]`\n"
-        if url:
-            out += f"🔗 {url}\n"
+        # truncate URL for table
+        url_disp = url if len(url) < 60 else url[:57] + "..."
+        out += f"| {i} | {title} | `{eng}` | [{url_disp}]({url}) |\n"
+    out += f"\n## Detailed Results\n\n"
+    for i, r in enumerate(results, 1):
+        title = clean_text(r.get("title","Untitled") or "Untitled", 200).strip()
+        url = r.get("url","")
+        snippet = clean_text(r.get("snippet",""), 500)
+        eng = r.get("engine","unknown")
+        out += f"### {i}. {title}\n\n"
+        out += f"- **Engine:** `{eng}`\n"
+        out += f"- **URL:** [{url}]({url})\n"
         if snippet:
-            out += f"{snippet}\n"
-        out += "\n"
-    out += "> Sovereign: directly scraped search engines, no external API key. Use `fetch_page` for full content.\n"
+            out += f"- **Snippet:** {snippet}\n"
+        out += f"\n---\n\n"
+    out += f"> **Sovereign:** directly scraped via `httpx` + `BeautifulSoup`, no external API key. Use `fetch_page(url)` for full markdown content.\n"
+    out += f"> **MCP:** `search_web` via `stdio JSON-RPC 2.0` (`FastMCP`)\n"
+    # Also include clear structured data block for programmatic use (still markdown)
+    out += f"\n<details>\n<summary>📦 Structured Data (JSON)</summary>\n\n```json\n"
+    out += json.dumps([{"rank": i, "title": r.get("title"), "url": r.get("url"), "engine": r.get("engine"), "snippet": clean_text(r.get("snippet",""), 300)} for i, r in enumerate(results, 1)], indent=2, ensure_ascii=False)
+    out += f"\n```\n</details>\n"
     return out
 
 @mcp.tool()
@@ -578,7 +606,8 @@ async def fetch_page(
     extract_mode: str = "text"
 ) -> str:
     """
-    Sovereign fetch - directly fetch URL and extract readable content, no external service.
+    Sovereign fetch - directly fetch URL and extract readable markdown, no external service.
+    Returns clear markdown with metadata + content.
     
     Args:
         url: Full URL (http:// or https://)
@@ -587,20 +616,26 @@ async def fetch_page(
     """
     max_length = max(1000, min(30000, max_length))
     if not url.startswith(("http://","https://")):
-        return "Error: URL must start with http:// or https://"
+        return f"# Error\n\n**Message:** URL must start with `http://` or `https://`\n\n**Received:** `{url}`\n"
     if extract_mode == "html":
         try:
             headers = random_headers()
             async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
-                return f"# {url}\n\n```html\n{resp.text[:max_length]}\n```"
+                return f"# Fetched: {url}\n\n**Mode:** `html` | **Length:** `{len(resp.text)}` | **Truncated:** `{max_length}`\n\n```html\n{resp.text[:max_length]}\n```\n"
         except Exception as e:
-            return f"Failed to fetch {url}: {e}"
+            return f"# Fetch Failed\n\n**URL:** `{url}`\n\n**Error:** `{e}`\n"
     content = await sovereign_fetch(url, max_length)
-    if extract_mode == "markdown":
-        return f"# Source: {url}\n\n{content}"
-    return f"# Source: {url}\n\n{content}"
+    if content.startswith("Failed to fetch"):
+        return f"# Fetch Failed\n\n**URL:** `{url}`\n\n**Error:** {content}\n"
+    # Clear markdown with metadata header
+    out = f"# Fetched Content\n\n"
+    out += f"**Source:** [{url}]({url}) | **Mode:** `{extract_mode}` | **Length:** `{len(content)}` chars\n\n"
+    out += f"---\n\n"
+    out += content
+    out += f"\n\n---\n\n> **Sovereign Fetch:** direct `httpx` + `BeautifulSoup` readability, no external API. **MCP:** `fetch_page` via `stdio`\n"
+    return out
 
 @mcp.tool()
 async def search_and_fetch(
@@ -636,14 +671,19 @@ async def search_and_fetch(
     results, _ = await sovereign_search(query, count, engine_list)
     if not results:
         return search_result
-    out = search_result + "\n\n---\n\n## 📄 Sovereign Fetched Content (Direct Fetch, No API)\n\n"
-    for r in results[:fetch_top]:
+    out = search_result + "\n\n---\n\n# 📄 Sovereign Fetched Content\n\n"
+    out += f"**Query:** `{query}` | **Fetched:** `{min(fetch_top, len(results))}/{len(results)}` top results | **Method:** `direct httpx` (sovereign)\n\n"
+    for idx, r in enumerate(results[:fetch_top], 1):
         url = r.get("url")
-        if not url or "wikipedia.org" in url and False:
+        if not url:
             continue
-        out += f"\n### Fetching: {r.get('title')} `[{r.get('engine')}]`\n> {url}\n\n"
+        out += f"## {idx}. {r.get('title')} `[{r.get('engine')}]`\n\n"
+        out += f"**URL:** [{url}]({url})\n\n"
         content = await sovereign_fetch(url, 5000)
-        out += content + "\n\n---\n"
+        # content already has its own header, but we wrap it clearly
+        out += f"<details>\n<summary>📖 Full Content ({len(content)} chars)</summary>\n\n"
+        out += content
+        out += f"\n</details>\n\n---\n\n"
     return out
 
 @mcp.tool()
