@@ -1,0 +1,20 @@
+[project]
+name = "mcp-web-search"
+version = "0.1.0"
+description = "MCP server for web search - find anything on the web"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.9.4,<3",
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    # Sovereign: no API-key deps, only direct scraping. No ddgs/serper needed.
+]
+
+[project.scripts]
+mcp-web-search = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
